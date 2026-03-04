@@ -22,6 +22,17 @@ interface Message {
     role: "ai" | "user";
     content: string;
     timestamp: Date;
+    score?: number;
+    evaluation?: string;
+}
+
+interface SessionData {
+    messages: Message[];
+    scores: number[];
+    stack: string;
+    level: string;
+    elapsedTime: number;
+    questionCount: number;
 }
 
 const STACK_LABELS: Record<string, string> = {
@@ -60,8 +71,10 @@ function InterviewRoom() {
         `// Write your code solution here\n// The interviewer may ask you to\n// demonstrate your answer in code.\n\nfunction solution() {\n  // your code here\n}\n`
     );
     const [copied, setCopied] = useState(false);
+    const [submitted, setSubmitted] = useState(false);
     const [elapsedTime, setElapsedTime] = useState(0);
     const [questionCount, setQuestionCount] = useState(0);
+    const [scores, setScores] = useState<number[]>([]);
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [theme] = useState<"dark" | "light">(() => {
         if (typeof window !== "undefined") {
@@ -71,20 +84,29 @@ function InterviewRoom() {
     });
     const [cursorLine, setCursorLine] = useState(1);
     const [cursorCol, setCursorCol] = useState(1);
+    const [questionTimeLeft, setQuestionTimeLeft] = useState<number | null>(null);
+    const [questionType, setQuestionType] = useState<"chat" | "code" | null>(null);
+    const [isReady, setIsReady] = useState(false);
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const timerRef = useRef<NodeJS.Timeout | null>(null);
     const abortRef = useRef<AbortController | null>(null);
+    const scoreProcessedRef = useRef<Set<string>>(new Set());
     const codeEditorRef = useRef<HTMLDivElement>(null);
     const lineNumbersRef = useRef<HTMLDivElement>(null);
     const codeTextareaRef = useRef<HTMLTextAreaElement>(null);
+    const questionTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const autoSubmitRef = useRef<(() => void) | null>(null);
+    const autoSubmitCodeRef = useRef<(() => void) | null>(null);
+    const autoSubmitFiredRef = useRef(false);
 
     // Timer
     useEffect(() => {
         timerRef.current = setInterval(() => setElapsedTime((t) => t + 1), 1000);
         return () => {
             if (timerRef.current) clearInterval(timerRef.current);
+            if (questionTimerRef.current) clearInterval(questionTimerRef.current);
             abortRef.current?.abort();
         };
     }, []);
@@ -113,27 +135,57 @@ function InterviewRoom() {
         return `${m}:${sec}`;
     };
 
-    // First AI greeting
+    const startQuestionTimer = (type: "chat" | "code") => {
+        if (questionTimerRef.current) {
+            clearInterval(questionTimerRef.current);
+        }
+        autoSubmitFiredRef.current = false;
+
+        const duration = type === "chat" ? 120 : 300;
+        setQuestionType(type);
+        setQuestionTimeLeft(duration);
+
+        questionTimerRef.current = setInterval(() => {
+            setQuestionTimeLeft((prev) => {
+                if (prev === null || prev <= 1) {
+                    clearInterval(questionTimerRef.current!);
+
+                    if (autoSubmitFiredRef.current) return null;
+                    autoSubmitFiredRef.current = true;
+
+                    if (type === "chat") {
+                        setInputValue("Time's up — I could not complete my answer.");
+                        setTimeout(() => {
+                            autoSubmitRef.current?.();
+                        }, 200);
+                    } else {
+                        setTimeout(() => {
+                            autoSubmitCodeRef.current?.();
+                        }, 200);
+                    }
+
+                    return null;
+                }
+                return prev - 1;
+            });
+        }, 1000);
+    };
+
+    // Keep auto-submit refs current on every render (avoids stale closure in timer)
+    useEffect(() => {
+        autoSubmitRef.current = () => sendMessage(false);
+        autoSubmitCodeRef.current = () => sendMessage(true);
+    });
+
+    // Welcome greeting
     useEffect(() => {
         const greeting: Message = {
             id: "init",
             role: "ai",
-            content: `Hello! I'm your AI interviewer for today's ${STACK_LABELS[stack] || stack} session at the ${LEVEL_LABELS[level] || level} level.\n\nLet's get started. First question:\n\n**Can you walk me through how ${stack === "react"
-                ? "the Virtual DOM works in React and what makes it more efficient than direct DOM manipulation?"
-                : stack === "nodejs"
-                    ? "the Event Loop works in Node.js and why it's important for handling asynchronous operations?"
-                    : stack === "system-design"
-                        ? "you would design a URL shortener service like bit.ly at scale?"
-                        : stack === "python"
-                            ? "Python's GIL (Global Interpreter Lock) works and when it can be a bottleneck?"
-                            : stack === "algorithms"
-                                ? "you would approach solving a problem involving finding the shortest path in a weighted graph?"
-                                : `the core concepts of ${STACK_LABELS[stack] || stack} that you find most important?`
-                }**\n\nTake your time. You can also use the code editor on the right if you need to illustrate your answer with code.`,
+            content: `Welcome! 👋 I'm your AI interviewer for today's **${STACK_LABELS[stack] || stack}** session at the **${LEVEL_LABELS[level] || level}** level.\n\nAre you ready to begin?`,
             timestamp: new Date(),
         };
         setMessages([greeting]);
-        setQuestionCount(1);
     }, [stack, level]);
 
     // Scroll to bottom
@@ -141,13 +193,51 @@ function InterviewRoom() {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [messages]);
 
-    const sendMessage = async () => {
-        if (!inputValue.trim() || isLoading) return;
+    // Timer start + auto-end — runs after React commits updated questionCount/scores
+    useEffect(() => {
+        if (!isReady) return;
+        if (questionCount === 0) return;
+        if (isLoading) return;
+
+        if (scores.length >= 6) {
+            clearInterval(questionTimerRef.current!);
+            setQuestionTimeLeft(null);
+            setIsLoading(true);
+            setTimeout(() => endInterview(), 3000);
+            return;
+        }
+
+        const type = questionCount % 2 !== 0 ? "chat" : "code";
+        startQuestionTimer(type);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [questionCount, scores.length, isReady]);
+
+    const sendMessage = async (includeCode = false) => {
+        if (!inputValue.trim() && !includeCode) return;
+        if (isLoading) return;
+
+        // Clear question timer immediately when user submits
+        if (questionTimerRef.current) {
+            clearInterval(questionTimerRef.current);
+        }
+        setQuestionTimeLeft(null);
+        autoSubmitFiredRef.current = false;
+
+        let content = inputValue.trim();
+
+        if (includeCode && codeValue.trim()) {
+            const hasUserText = content.length > 0;
+            content = hasUserText
+                ? `${content}\n\n\`\`\`javascript\n${codeValue.trim()}\n\`\`\``
+                : `Here is my code solution:\n\n\`\`\`javascript\n${codeValue.trim()}\n\`\`\``;
+        }
+
+        if (!content) return;
 
         const userMsg: Message = {
             id: Date.now().toString(),
             role: "user",
-            content: inputValue.trim(),
+            content,
             timestamp: new Date(),
         };
 
@@ -172,6 +262,7 @@ function InterviewRoom() {
                     stack,
                     level,
                     history: messages.map((m) => ({ role: m.role, content: m.content })),
+                    questionNumber: questionCount + 1,
                 }),
             });
 
@@ -226,6 +317,41 @@ function InterviewRoom() {
             }
 
             setQuestionCount((q) => q + 1);
+
+            // Parse score + evaluation from completed AI message
+            setMessages((prev) => {
+                const lastMsg = prev[prev.length - 1];
+                if (lastMsg?.role !== "ai") return prev;
+
+                // Parse score
+                const scoreMatch = lastMsg.content.match(/\[SCORE:(\d+)\]/);
+                const score = scoreMatch
+                    ? Math.min(100, Math.max(0, parseInt(scoreMatch[1])))
+                    : undefined;
+
+                if (score !== undefined) {
+                    if (!scoreProcessedRef.current.has(lastMsg.id)) {
+                        scoreProcessedRef.current.add(lastMsg.id);
+                        setScores((s) => [...s, score]);
+                    }
+                }
+
+                // Parse evaluation between tags
+                const evalMatch = lastMsg.content.match(/EVALUATION_START([\s\S]*?)EVALUATION_END/);
+                const evaluation = evalMatch ? evalMatch[1].trim() : undefined;
+
+                // Strip SCORE + EVALUATION from chat display
+                const cleanContent = lastMsg.content
+                    .replace(/\n?\[SCORE:\d+\]/, "")
+                    .replace(/\n?EVALUATION_START[\s\S]*?EVALUATION_END/, "")
+                    .trim();
+
+                return prev.map((m) =>
+                    m.id === lastMsg.id
+                        ? { ...m, content: cleanContent, score, evaluation }
+                        : m
+                );
+            });
         } catch {
             setMessages((prev) => [
                 ...prev,
@@ -239,6 +365,88 @@ function InterviewRoom() {
         } finally {
             inputRef.current?.focus();
         }
+    };
+
+    const handleReady = async () => {
+        setIsReady(true);
+        const userMsg: Message = {
+            id: Date.now().toString(),
+            role: "user",
+            content: "Yes, I'm ready!",
+            timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, userMsg]);
+        setIsLoading(true);
+
+        const aiMsgId = (Date.now() + 1).toString();
+        let firstChunkReceived = false;
+
+        try {
+            abortRef.current?.abort();
+            abortRef.current = new AbortController();
+
+            const res = await fetch("/api/chat", {
+                method: "POST",
+                signal: abortRef.current.signal,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    message: "Yes, I'm ready to start!",
+                    stack,
+                    level,
+                    history: [],
+                    questionNumber: 1,
+                    isFirstQuestion: true,
+                }),
+            });
+
+            if (!res.ok || !res.body) throw new Error(`Request failed with status ${res.status}`);
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+
+                if (!firstChunkReceived) {
+                    setMessages((prev) => [
+                        ...prev,
+                        { id: aiMsgId, role: "ai", content: chunk, timestamp: new Date() },
+                    ]);
+                    firstChunkReceived = true;
+                } else {
+                    setMessages((prev) =>
+                        prev.map((m) =>
+                            m.id === aiMsgId ? { ...m, content: m.content + chunk } : m
+                        )
+                    );
+                }
+            }
+
+            setQuestionCount(1);
+        } catch (err: any) {
+            if (err.name === "AbortError") return;
+        } finally {
+            setIsLoading(false);
+            inputRef.current?.focus();
+        }
+    };
+
+    const handleNotReady = () => {
+        const notReadyMsg: Message = {
+            id: Date.now().toString(),
+            role: "user",
+            content: "No, not yet.",
+            timestamp: new Date(),
+        };
+        const aiResponse: Message = {
+            id: (Date.now() + 1).toString(),
+            role: "ai",
+            content: `No problem! Take your time.\nWhenever you're ready, click **"Yes, let's go!"** to begin. 🙂`,
+            timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, notReadyMsg, aiResponse]);
     };
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -269,22 +477,67 @@ function InterviewRoom() {
         setTimeout(() => setCopied(false), 2000);
     };
 
-    const renderInlineMarkdown = (text: string, key: number) => {
-        const parts = text.split(/(\*\*.*?\*\*)/g);
-        return (
-            <p key={key} className="mt-1 first:mt-0">
-                {parts.map((part, i) => {
-                    if (part.startsWith("**") && part.endsWith("**")) {
-                        return (
-                            <strong key={i} className="font-semibold" style={{ color: "var(--text-primary)" }}>
-                                {part.slice(2, -2)}
-                            </strong>
-                        );
-                    }
-                    return <span key={i}>{part}</span>;
-                })}
-            </p>
-        );
+    const handleSubmitCode = () => {
+        if (!codeValue.trim() || isLoading) return;
+        sendMessage(true);
+        setSubmitted(true);
+        setTimeout(() => setSubmitted(false), 2000);
+    };
+
+    const endInterview = () => {
+        const sessionData: SessionData = {
+            messages,
+            scores,
+            stack,
+            level,
+            elapsedTime,
+            questionCount,
+        };
+        localStorage.setItem("mockai_session", JSON.stringify(sessionData));
+        router.push("/summary");
+    };
+
+    const renderMessageContent = (content: string) => {
+        const blocks = content.split(/(```[\s\S]*?```)/g);
+        return blocks.map((block, i) => {
+            if (block.startsWith("```") && block.endsWith("```")) {
+                const lines = block.slice(3, -3).split("\n");
+                const lang = lines[0].trim();
+                const code = lang ? lines.slice(1).join("\n") : lines.join("\n");
+                return (
+                    <pre
+                        key={i}
+                        className="mt-2 mb-2 p-3 rounded-lg text-xs overflow-x-auto"
+                        style={{
+                            background: "rgba(0,0,0,0.3)",
+                            border: "1px solid var(--border)",
+                            fontFamily: "JetBrains Mono, monospace",
+                            color: "#e2e8f0",
+                            lineHeight: "1.6",
+                        }}
+                    >
+                        <code>{code}</code>
+                    </pre>
+                );
+            }
+            return block.split("\n").map((line, j) => {
+                if (!line) return <br key={`${i}-${j}`} />;
+                const parts = line.split(/(\*\*.*?\*\*)/g);
+                return (
+                    <p key={`${i}-${j}`} className="mt-1 first:mt-0">
+                        {parts.map((part, k) =>
+                            part.startsWith("**") && part.endsWith("**") ? (
+                                <strong key={k} className="font-semibold" style={{ color: "var(--text-primary)" }}>
+                                    {part.slice(2, -2)}
+                                </strong>
+                            ) : (
+                                <span key={k}>{part}</span>
+                            )
+                        )}
+                    </p>
+                );
+            });
+        });
     };
 
     const renderMessage = (msg: Message) => {
@@ -306,9 +559,7 @@ function InterviewRoom() {
                     </div>
                 )}
                 <div className={isAI ? "chat-bubble-ai" : "chat-bubble-user"}>
-                    {msg.content.split("\n").map((line, i) =>
-                        line ? renderInlineMarkdown(line, i) : <br key={i} />
-                    )}
+                    {renderMessageContent(msg.content)}
                     <p className="bubble-timestamp text-[10px] mt-2" style={{ color: "var(--text-secondary)" }}>
                         {msg.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                     </p>
@@ -420,6 +671,30 @@ function InterviewRoom() {
                         </span>
                     </div>
 
+                    {/* Average score badge */}
+                    {scores.length > 0 && (() => {
+                        const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+                        return (
+                            <div
+                                className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium"
+                                style={{
+                                    background: "var(--bg-card)",
+                                    border: "1px solid var(--border-strong)",
+                                }}
+                            >
+                                <span style={{ color: "var(--text-secondary)" }}>Avg</span>
+                                <span
+                                    style={{
+                                        color: avg >= 80 ? "#4ade80" : avg >= 60 ? "#facc15" : "#f87171",
+                                        fontWeight: 600,
+                                    }}
+                                >
+                                    {avg}/100
+                                </span>
+                            </div>
+                        );
+                    })()}
+
                 </div>
             </header>
 
@@ -476,53 +751,219 @@ function InterviewRoom() {
                         <div ref={messagesEndRef} />
                     </div>
 
-                    {/* Input area */}
-                    <div className="p-4" style={{ borderTop: "1px solid var(--border)" }}>
-                        <div className="flex gap-3 items-end">
-                            <div className="flex-1">
-                                <textarea
-                                    ref={inputRef}
-                                    id="answer-input"
-                                    value={inputValue}
-                                    onChange={(e) => setInputValue(e.target.value)}
-                                    onKeyDown={handleKeyDown}
-                                    placeholder="Type your answer... (Enter to send, Shift+Enter for newline)"
-                                    rows={3}
-                                    disabled={isLoading}
-                                    className="w-full resize-none rounded-xl px-4 py-3 text-sm outline-none transition-all duration-200 disabled:opacity-50"
-                                    style={{
-                                        background: "var(--bg-card)",
-                                        border: "1px solid var(--border)",
-                                        color: "var(--text-primary)",
-                                        caretColor: "var(--accent)",
-                                    }}
-                                    onFocus={(e) => {
-                                        e.target.style.borderColor = "var(--accent)";
-                                        e.target.style.boxShadow = "0 0 0 3px var(--accent-glow)";
-                                    }}
-                                    onBlur={(e) => {
-                                        e.target.style.borderColor = "var(--border)";
-                                        e.target.style.boxShadow = "none";
-                                    }}
-                                />
+                    {/* Question timer */}
+                    {questionTimeLeft !== null && !isLoading && (
+                        <div style={{
+                            padding: "8px 16px",
+                            borderTop: "1px solid var(--border)",
+                            background: "var(--bg-card)",
+                        }}>
+                            <div style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                marginBottom: "6px",
+                            }}>
+                                <span style={{
+                                    fontSize: "12px",
+                                    fontWeight: 600,
+                                    color: questionType === "chat" ? "#6366f1" : "#f59e0b",
+                                }}>
+                                    {questionType === "chat"
+                                        ? "💬 Chat Answer"
+                                        : "💻 Code Answer"}
+                                </span>
+                                <span style={{
+                                    fontSize: "13px",
+                                    fontWeight: 700,
+                                    color: questionTimeLeft <= 30
+                                        ? "#f87171"
+                                        : questionTimeLeft <= 60
+                                        ? "#facc15"
+                                        : "var(--text-primary)",
+                                }}>
+                                    {Math.floor(questionTimeLeft / 60)}:
+                                    {(questionTimeLeft % 60).toString().padStart(2, "0")}
+                                </span>
                             </div>
+                            {questionTimeLeft <= 10 && (
+                                <p style={{
+                                    fontSize: "11px",
+                                    color: "#f87171",
+                                    fontWeight: 600,
+                                    textAlign: "center",
+                                    marginBottom: "4px",
+                                    animation: "pulse 1s infinite",
+                                }}>
+                                    ⚠️ Time is almost up!
+                                </p>
+                            )}
+                            <div style={{
+                                height: "3px",
+                                background: "var(--border)",
+                                borderRadius: "9999px",
+                                overflow: "hidden",
+                            }}>
+                                <div style={{
+                                    height: "100%",
+                                    borderRadius: "9999px",
+                                    transition: "width 1s linear",
+                                    background: questionTimeLeft <= 30
+                                        ? "#f87171"
+                                        : questionTimeLeft <= 60
+                                        ? "#facc15"
+                                        : "#6366f1",
+                                    width: `${(questionTimeLeft / (questionType === "chat" ? 120 : 300)) * 100}%`,
+                                }} />
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Ready buttons (pre-interview) */}
+                    {!isReady && (
+                        <div style={{
+                            display: "flex",
+                            gap: "12px",
+                            padding: "16px",
+                            borderTop: "1px solid var(--border)",
+                            justifyContent: "center",
+                        }}>
                             <button
-                                id="send-btn"
-                                onClick={sendMessage}
-                                disabled={!inputValue.trim() || isLoading}
-                                className="btn-send p-3 flex-shrink-0"
+                                onClick={() => handleNotReady()}
+                                disabled={isLoading}
+                                style={{
+                                    padding: "10px 32px",
+                                    borderRadius: "10px",
+                                    background: "var(--bg-card)",
+                                    border: "1px solid var(--border)",
+                                    color: "var(--text-secondary)",
+                                    fontSize: "14px",
+                                    fontWeight: 500,
+                                    cursor: isLoading ? "not-allowed" : "pointer",
+                                    opacity: isLoading ? 0.5 : 1,
+                                }}
                             >
-                                <Send className="w-4 h-4" />
+                                ❌ No, not yet
+                            </button>
+                            <button
+                                onClick={() => handleReady()}
+                                disabled={isLoading}
+                                style={{
+                                    padding: "10px 32px",
+                                    borderRadius: "10px",
+                                    background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+                                    border: "none",
+                                    color: "white",
+                                    fontSize: "14px",
+                                    fontWeight: 600,
+                                    cursor: isLoading ? "not-allowed" : "pointer",
+                                    opacity: isLoading ? 0.5 : 1,
+                                }}
+                            >
+                                ✅ Yes, let's go!
                             </button>
                         </div>
-                        <p className="text-[11px] mt-2 pl-1" style={{ color: "var(--text-secondary)" }}>
-                            Press Enter to send · Shift+Enter for a new line
-                        </p>
-                    </div>
+                    )}
+
+                    {/* Input area (active interview) */}
+                    {isReady && (
+                        <div className="p-4" style={{ borderTop: "1px solid var(--border)" }}>
+                            {questionType === "code" && (
+                                <p style={{
+                                    fontSize: "12px",
+                                    color: "var(--text-secondary)",
+                                    textAlign: "center",
+                                    padding: "8px",
+                                }}>
+                                    💻 Write your answer in the code editor
+                                </p>
+                            )}
+                            <div
+                                className="flex gap-3 items-end"
+                                style={{
+                                    transition: "opacity 0.3s ease",
+                                    opacity: questionType === "code" ? 0.4 : 1,
+                                    pointerEvents: questionType === "code" ? "none" : "auto",
+                                }}
+                            >
+                                <div className="flex-1">
+                                    <textarea
+                                        ref={inputRef}
+                                        id="answer-input"
+                                        value={inputValue}
+                                        onChange={(e) => setInputValue(e.target.value)}
+                                        onKeyDown={handleKeyDown}
+                                        placeholder="Type your answer... (Enter to send, Shift+Enter for newline)"
+                                        rows={3}
+                                        disabled={isLoading || questionType === "code"}
+                                        className="w-full resize-none rounded-xl px-4 py-3 text-sm outline-none transition-all duration-200 disabled:opacity-50"
+                                        style={{
+                                            background: "var(--bg-card)",
+                                            border: "1px solid var(--border)",
+                                            color: "var(--text-primary)",
+                                            caretColor: "var(--accent)",
+                                        }}
+                                        onFocus={(e) => {
+                                            e.target.style.borderColor = "var(--accent)";
+                                            e.target.style.boxShadow = "0 0 0 3px var(--accent-glow)";
+                                        }}
+                                        onBlur={(e) => {
+                                            e.target.style.borderColor = "var(--border)";
+                                            e.target.style.boxShadow = "none";
+                                        }}
+                                    />
+                                </div>
+                                <button
+                                    id="send-btn"
+                                    onClick={() => sendMessage()}
+                                    disabled={!inputValue.trim() || isLoading || questionType === "code"}
+                                    className="btn-send p-3 flex-shrink-0"
+                                >
+                                    <Send className="w-4 h-4" />
+                                </button>
+                            </div>
+                            <p className="text-[11px] mt-2 pl-1" style={{ color: "var(--text-secondary)" }}>
+                                Press Enter to send · Shift+Enter for a new line
+                            </p>
+                        </div>
+                    )}
                 </div>
 
                 {/* RIGHT: Code Editor */}
-                <div ref={codeEditorRef} className="flex flex-col w-1/2">
+                <div
+                    ref={codeEditorRef}
+                    className="flex flex-col w-1/2"
+                    style={{
+                        position: "relative",
+                        transition: "opacity 0.3s ease, filter 0.3s ease",
+                        opacity: questionType === "chat" ? 0.4 : 1,
+                        filter: questionType === "chat" ? "blur(2px)" : "none",
+                        pointerEvents: questionType === "chat" ? "none" : "auto",
+                    }}
+                >
+                    {questionType === "chat" && (
+                        <div style={{
+                            position: "absolute",
+                            inset: 0,
+                            zIndex: 10,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            flexDirection: "column",
+                            gap: "8px",
+                            pointerEvents: "none",
+                        }}>
+                            <span style={{ fontSize: "24px" }}>💬</span>
+                            <p style={{
+                                fontSize: "13px",
+                                fontWeight: 600,
+                                color: "var(--text-secondary)",
+                                textAlign: "center",
+                            }}>
+                                Answer in chat
+                            </p>
+                        </div>
+                    )}
                     {/* Editor panel header */}
                     <div
                         className="flex items-center gap-2 px-5 py-3"
@@ -547,6 +988,18 @@ function InterviewRoom() {
                             JavaScript
                         </span>
                         <div className="ml-auto flex items-center gap-2">
+                            <button
+                                onClick={handleSubmitCode}
+                                disabled={isLoading || !codeValue.trim()}
+                                className="btn-secondary text-xs py-1 px-2.5 gap-1 disabled:opacity-40 disabled:cursor-not-allowed"
+                                title="Submit code to AI"
+                            >
+                                {submitted ? (
+                                    <><Check className="w-3.5 h-3.5 text-green-400" /><span>Sent!</span></>
+                                ) : (
+                                    <><Send className="w-3.5 h-3.5" /><span>Submit Code</span></>
+                                )}
+                            </button>
                             <button
                                 onClick={handleCopyCode}
                                 className="btn-secondary text-xs py-1 px-2.5 gap-1"
